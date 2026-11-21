@@ -1,20 +1,22 @@
-"""FastAPI 入口：上传参考/待检 WAV，返回冲次核对结果。"""
+"""FastAPI 入口：上传敲击 WAV 与两段尾音区间、待查频带，返回共振核对结果。"""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from .audio import AudioValidationError, MAX_DURATION_SEC, SAMPLE_RATE
+from .resonance import ResonanceError
 from .service import MAX_UPLOAD_BYTES, Store
 
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", "/workspace/data"))
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="冲压机冲次声音核对", version="1.0.0")
+app = FastAPI(title="模具敲击尾音共振核对", version="2.0.0")
 store = Store(DATA_DIR)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -22,7 +24,6 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/data/uploads/{name}")
 def get_upload(name: str) -> FileResponse:
-    # 动态读取 store 的上传目录，更换 DATA_DIR 或测试夹具后仍可回传录音
     if "/" in name or ".." in name or not name.endswith(".wav"):
         raise HTTPException(status_code=400, detail="非法文件名")
     path = store.uploads_dir / name
@@ -55,35 +56,52 @@ def clear_result() -> dict[str, str]:
     return {"status": "cleared"}
 
 
-@app.post("/api/inspect")
-async def inspect(
-    reference: UploadFile = File(..., description="正常循环参考 WAV"),
-    test: UploadFile = File(..., description="待检循环 WAV"),
-) -> dict:
-    async def read_wav(file: UploadFile, label: str) -> bytes:
-        if not (file.filename or "").lower().endswith(".wav"):
-            raise HTTPException(
-                status_code=400, detail=f"{label}必须是 .wav 文件"
-            )
-        raw = await file.read()
-        if not raw:
-            raise HTTPException(status_code=400, detail=f"{label}文件为空")
-        if len(raw) > MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"{label}文件过大；仅支持 {SAMPLE_RATE}Hz/16bit/单声道、"
-                    f"不超过 {MAX_DURATION_SEC:.0f} 秒的 WAV"
-                ),
-            )
-        return raw
+def _parse_sample(value: str, label: str) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{label}必须是采样点整数"
+        ) from exc
+    if n < 0:
+        raise HTTPException(status_code=400, detail=f"{label}不能为负数")
+    return n
 
-    ref_raw = await read_wav(reference, "参考录音")
-    test_raw = await read_wav(test, "待检录音")
+
+@app.post("/api/analyze")
+async def analyze(
+    wav: UploadFile = File(..., description="敲击录音 WAV"),
+    seg1_start: int = Form(...),
+    seg1_end: int = Form(...),
+    seg2_start: int = Form(...),
+    seg2_end: int = Form(...),
+    band_lo: float = Form(...),
+    band_hi: float = Form(...),
+) -> dict:
+    if not (wav.filename or "").lower().endswith(".wav"):
+        raise HTTPException(status_code=400, detail="只接受 .wav 文件")
+    raw = await wav.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="WAV 文件为空")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"文件过大；仅支持 {SAMPLE_RATE}Hz/16bit/单声道、"
+                f"不超过 {MAX_DURATION_SEC:.0f} 秒的 WAV"
+            ),
+        )
+
+    seg1 = (_parse_sample(str(seg1_start), "第 1 段起点"),
+            _parse_sample(str(seg1_end), "第 1 段终点"))
+    seg2 = (_parse_sample(str(seg2_start), "第 2 段起点"),
+            _parse_sample(str(seg2_end), "第 2 段终点"))
 
     try:
-        # 任何 AudioValidationError 都会在 store 写入前抛出，
-        # 因此无效音频不会覆盖上一次有效结果
-        return store.inspect(ref_raw, test_raw)
-    except AudioValidationError as exc:
+        # 拟合是 CPU 密集型（双频约 10~20s），放入线程池避免阻塞事件循环
+        return await run_in_threadpool(
+            store.analyze, raw, seg1, seg2, float(band_lo), float(band_hi)
+        )
+    except (AudioValidationError, ResonanceError) as exc:
+        # 任何校验/拟合前错误都在 store 写入前抛出，不会覆盖上一次有效结果
         raise HTTPException(status_code=400, detail=str(exc)) from exc

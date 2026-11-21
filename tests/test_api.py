@@ -1,14 +1,33 @@
 """端到端 API 关键流程测试。"""
+import io
+import wave
+
+import numpy as np
 import pytest
 
-from conftest import build_wav, post_inspect
+from conftest import SR, build_tail_wav, post_analyze, silent_wav
+
+F1, F2, LAM, DUR = 432.0, 715.0, 14.0, 320
 
 
-REF_TIMES = [0.5, 1.0, 1.5, 2.0]
+def _single():
+    return build_tail_wav([
+        {"start_ms": 200, "dur_ms": DUR,
+         "components": [(F1, 0.65, 0.3)], "decay_rate": LAM},
+        {"start_ms": 1100, "dur_ms": DUR,
+         "components": [(F1, 0.5, 1.7)], "decay_rate": LAM},
+    ])
 
 
-def _ref():
-    return build_wav(REF_TIMES, duration=2.6, noise_floor=0.002)
+def _dual():
+    return build_tail_wav([
+        {"start_ms": 200, "dur_ms": DUR,
+         "components": [(F1, 0.55, 0.2), (F2, 0.35, 1.0)],
+         "decay_rate": LAM},
+        {"start_ms": 1100, "dur_ms": DUR,
+         "components": [(F1, 0.45, 1.8), (F2, 0.4, 2.4)],
+         "decay_rate": LAM},
+    ])
 
 
 def test_health_and_empty_result(client):
@@ -16,114 +35,134 @@ def test_health_and_empty_result(client):
     assert client.get("/api/result/last").status_code == 404
 
 
-def test_full_normal_cycle(client):
-    test = build_wav([1.1, 1.6, 2.1, 2.6], duration=3.2)  # 带起始静音
-    resp = post_inspect(client, _ref(), test)
+def test_single_frequency_flow(client):
+    wav, ranges = _single()
+    resp = post_analyze(client, wav, ranges)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["verdict"] == "ok"
-    assert body["summary"]["miss_count"] == 0
-    assert body["summary"]["extra_count"] == 0
-    # 结果已持久化，可再次获取
+    assert body["status"] == "single"
+    assert body["frequencies_hz"][0] == pytest.approx(F1, abs=1.5)
+    assert len(body["holdout_ratios"]) == 2
+    assert all(x <= 0.10 for x in body["holdout_ratios"])
+    # 结果持久化，可再次获取
     last = client.get("/api/result/last").json()
     assert last["id"] == body["id"]
 
 
-def test_full_missed_impact(client):
-    test = build_wav([0.5, 1.0, 2.0], duration=2.6)  # 漏第 3 冲
-    body = post_inspect(client, _ref(), test).json()
-    assert body["verdict"] == "defect"
-    assert body["summary"]["miss_count"] == 1
-    missed = body["missed"][0]
-    assert missed["ref_index"] == 2
-    # 后续冲次未错位：第 4 个参考冲次仍匹配待检最后一个
-    tail = [m for m in body["matches"] if m["ref_index"] == 3][0]
-    assert tail["test_index"] == 2
+def test_dual_frequency_flow(client):
+    wav, ranges = _dual()
+    body = post_analyze(client, wav, ranges).json()
+    assert body["status"] == "dual", body.get("reasons")
+    assert body["frequencies_hz"][1] - body["frequencies_hz"][0] >= 5.0
+    for ab in body["dual"]["ablation"]:
+        assert all(d >= 0.10 for d in ab["delta"])
 
 
-def test_full_extra_impact_and_echo(client):
-    test = build_wav(
-        [0.5, 1.0, 1.25, 1.5, 2.0],
-        duration=2.6,
-        echoes={0.5: 0.035},  # 35ms 回声，不应算多冲
-    )
-    body = post_inspect(client, _ref(), test).json()
-    assert body["summary"]["extra_count"] == 1
-    assert body["summary"]["suppressed_echo_count"] == 1
-    assert body["extras"][0]["time"] == pytest.approx(1.25, abs=0.015)
-
-
-def test_tempo_minus_12_percent_accepted(client):
-    t = [0.5 + (x - 0.5) * 0.88 for x in REF_TIMES]
-    body = post_inspect(client, _ref(), build_wav(t, duration=2.4)).json()
-    assert body["verdict"] == "ok"
-
-
-def test_ambiguous_requires_manual_review(client):
-    test = build_wav([0.5, 1.0, 1.5, 2.0, 2.5], duration=3.0)
-    body = post_inspect(client, _ref(), test).json()
-    assert body["ambiguous"] is True
-    assert body["verdict"] == "ambiguous"
-    assert any("人工复听" in w for w in body["warnings"])
-
-
-def test_invalid_audio_does_not_overwrite_last_result(client):
-    good = post_inspect(client, _ref(), build_wav(REF_TIMES, duration=2.6))
+def test_unconfirmed_overwrites_old_conclusion(client):
+    # 先得到一个有效的单频结论
+    wav_ok, ranges = _single()
+    good = post_analyze(client, wav_ok, ranges)
     assert good.status_code == 200
     good_id = good.json()["id"]
 
-    # 错误采样率
-    bad = build_wav(REF_TIMES, sr=8000, duration=2.6)
-    resp = post_inspect(client, _ref(), bad)
-    assert resp.status_code == 400
-    assert "采样率" in resp.json()["detail"]
-
-    # 参考冲次不足 4 次
-    bad_ref = build_wav([0.5, 1.0, 1.5], duration=2.0)
-    resp2 = post_inspect(client, bad_ref, build_wav(REF_TIMES, duration=2.6))
-    assert resp2.status_code == 400
-    assert "参考录音" in resp2.json()["detail"]
-
-    # 非 WAV
-    resp3 = client.post(
-        "/api/inspect",
-        files={
-            "reference": ("ref.wav", _ref(), "audio/wav"),
-            "test": ("test.txt", b"hello", "text/plain"),
-        },
-    )
-    assert resp3.status_code == 400
-
-    # 上一次结果仍在
-    last = client.get("/api/result/last").json()
-    assert last["id"] == good_id
-
-
-def test_silent_test_all_missed(client):
-    import io
-    import wave
-    import numpy as np
-
+    # 再提交纯噪声尾音：结论变为 unconfirmed，旧结论被撤下
+    rng = np.random.default_rng(9)
+    n = int(3.0 * SR)
+    noise = np.clip(rng.standard_normal(n) * 0.05, -1, 1).astype(np.float32)
+    pcm = (noise * 32767).astype("<i2").tobytes()
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(16000)
-        wf.writeframes(np.zeros(2 * 16000, dtype="<i2").tobytes())
-    body = post_inspect(client, _ref(), buf.getvalue()).json()
-    assert body["summary"]["test_impact_count"] == 0
-    assert body["summary"]["miss_count"] == 4
-    assert any("未检测到任何冲击" in w for w in body["warnings"])
+        wf.setframerate(SR)
+        wf.writeframes(pcm)
+    r1 = (int(0.2 * SR), int(0.52 * SR))
+    r2 = (int(1.1 * SR), int(1.42 * SR))
+    resp = post_analyze(client, buf.getvalue(), [r1, r2])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "unconfirmed"
+    assert body["id"] != good_id
+    assert body["reasons"]
+    stored = client.get("/api/result/last").json()
+    assert stored["status"] == "unconfirmed"
 
 
-def test_uploaded_audio_served_back(client):
-    body = post_inspect(client, _ref(), build_wav(REF_TIMES, duration=2.6)).json()
-    resp = client.get(body["test"]["url"])
+def test_invalid_inputs_return_400_and_keep_last_result(client):
+    wav, ranges = _single()
+    good = post_analyze(client, wav, ranges)
+    assert good.status_code == 200
+    good_id = good.json()["id"]
+
+    # 段时长不足 200ms
+    bad_range = [(int(0.2 * SR), int(0.35 * SR)), ranges[1]]
+    resp = post_analyze(client, wav, bad_range)
+    assert resp.status_code == 400
+    assert "200" in resp.json()["detail"]
+
+    # 两段重叠
+    overlap = [ranges[0], (ranges[0][0] + 100, ranges[0][1] + 100)]
+    resp = post_analyze(client, wav, overlap)
+    assert resp.status_code == 400
+    assert "互不重叠" in resp.json()["detail"]
+
+    # 频带超出 100~2000
+    resp = post_analyze(client, wav, ranges, band=(50.0, 2000.0))
+    assert resp.status_code == 400
+    assert "100~2000" in resp.json()["detail"]
+
+    # 非 WAV
+    (s1, e1), (s2, e2) = ranges
+    resp = client.post(
+        "/api/analyze",
+        data={"seg1_start": s1, "seg1_end": e1,
+              "seg2_start": s2, "seg2_end": e2,
+              "band_lo": 100, "band_hi": 2000},
+        files={"wav": ("tap.txt", b"hello", "text/plain")},
+    )
+    assert resp.status_code == 400
+
+    # 静音段无法拟合
+    resp = post_analyze(client, silent_wav(3.0), ranges)
+    assert resp.status_code == 400
+    assert "静音" in resp.json()["detail"]
+
+    # 上一次有效结果仍保留
+    assert client.get("/api/result/last").json()["id"] == good_id
+
+
+def test_wrong_wav_format_rejected(client):
+    wav, ranges = _single()
+    # 8kHz 重采样封装
+    with wave.open(io.BytesIO(wav), "rb") as wf:
+        pcm = wf.readframes(wf.getnframes())
+    low = io.BytesIO()
+    with wave.open(low, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(8000)
+        wf.writeframes(pcm[::2])
+    resp = post_analyze(client, low.getvalue(), ranges)
+    assert resp.status_code == 400
+    assert "采样率" in resp.json()["detail"]
+
+
+def test_uploaded_wav_served_back(client):
+    wav, ranges = _single()
+    body = post_analyze(client, wav, ranges).json()
+    resp = client.get(body["audio_url"])
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "audio/wav"
+
+
+def test_clear_result(client):
+    wav, ranges = _single()
+    post_analyze(client, wav, ranges)
+    assert client.delete("/api/result/last").status_code == 200
+    assert client.get("/api/result/last").status_code == 404
 
 
 def test_index_page(client):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "冲压机" in resp.text
+    assert "模具" in resp.text
